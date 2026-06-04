@@ -1,141 +1,202 @@
-import Database from 'better-sqlite3';
-import { Router } from 'express';
+import { Express } from 'express';
+import { db } from '../database';
+import { whatsappAccounts, autoReplyRules, autoReplyLogs } from '../database/schema';
+import { eq, desc } from 'drizzle-orm';
+import { v4 as uuidv4 } from 'uuid';
+import { logger } from '../utils/logger';
+import { buildAutoReplyBrainPreview } from '../services/auto-reply-brain.service';
 
-const router = Router();
-const db = new Database('./database/whatsapp-turbo.db');
+export function setupAutoReplyRoutes(app: Express) {
+  // Auto-Reply Rules - Get all
+  app.get('/api/auto-reply/rules', (req, res) => {
+    try {
+      const rules = db.select()
+        .from(autoReplyRules)
+        .orderBy(desc(autoReplyRules.createdAt))
+        .all();
 
-/**
- * GET /api/auto-reply/rules
- * Get all auto-reply rules
- */
-router.get('/rules', (req, res) => {
-  try {
-    const rules = db.prepare(`
-      SELECT ar.*, wa.phone_number as accountPhone
-      FROM auto_reply_rules ar
-      LEFT JOIN whatsapp_accounts wa ON ar.account_id = wa.id
-      ORDER BY ar.created_at DESC
-    `).all();
+      const accountsMap = new Map(
+        db.select().from(whatsappAccounts).all().map((account: any) => [account.id, account])
+      );
 
-    res.status(200).json(rules);
-  } catch (error: any) {
-    console.error('Error fetching auto-reply rules:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
+      const enrichedRules = rules.map((rule: any) => {
+        const account = accountsMap.get(rule.accountId);
+        return {
+          ...rule,
+          accountPhone: account?.phoneNumber || account?.phone_number || rule.accountId,
+          accountDisplayName: account?.displayName || account?.display_name || '',
+        };
+      });
+      
+      res.status(200).json(enrichedRules);
+    } catch (error: any) {
+      logger.error('Error fetching auto-reply rules:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
 
-/**
- * POST /api/auto-reply/rules
- * Create a new auto-reply rule
- */
-router.post('/rules', (req, res) => {
-  const { accountId, triggerType, triggerValue, activeHourStart, activeHourEnd, aiProvider, aiModel, systemPrompt, delayMin, delayMax, isEnabled } = req.body;
+  // Auto-Reply Rules - Create
+  app.post('/api/auto-reply/rules', (req, res) => {
+    try {
+      const { accountId, triggerType, triggerValue, activeHourStart, activeHourEnd, aiProvider, aiModel, systemPrompt, delayMin, delayMax, isEnabled, mediaPath, mediaType, mediaMimeType, mediaFileName, sendAsVoiceNote, silentPolicy, languagePolicy, escalationKeywords, allowFollowup } = req.body;
+      
+      const id = 'rule_' + uuidv4();
+      
+      db.insert(autoReplyRules).values({
+        id,
+        accountId,
+        name: `${triggerType} Rule`,
+        triggerType,
+        keywords: triggerType === 'keyword' ? triggerValue : '',
+        workingHours: `${activeHourStart}-${activeHourEnd}`,
+        aiProviderId: aiProvider,
+        aiModel,
+        systemPrompt,
+        mediaPath: mediaPath || null,
+        mediaType: mediaType || null,
+        mediaMimeType: mediaMimeType || null,
+        mediaFileName: mediaFileName || null,
+        sendAsVoiceNote: sendAsVoiceNote ? 1 : 0,
+        silentPolicy: silentPolicy || null,
+        languagePolicy: languagePolicy || null,
+        escalationKeywords: escalationKeywords || null,
+        allowFollowup: typeof allowFollowup === 'boolean' ? (allowFollowup ? 1 : 0) : 1,
+        responseDelayMinMs: delayMin * 1000,
+        responseDelayMaxMs: delayMax * 1000,
+        isActive: isEnabled ? 1 : 0,
+        createdAt: new Date().toISOString()
+      }).run();
 
-  try {
-    const id = 'rule_' + Date.now();
-    
-    db.prepare(`
-      INSERT INTO auto_reply_rules (
-        id, account_id, trigger_type, trigger_value, 
-        active_hour_start, active_hour_end, ai_provider, ai_model, 
-        system_prompt, delay_min, delay_max, is_enabled, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      id, accountId, triggerType, triggerValue,
-      activeHourStart, activeHourEnd, aiProvider, aiModel,
-      systemPrompt, delayMin, delayMax, isEnabled ? 1 : 0, new Date().toISOString()
-    );
+      res.status(201).json({
+        id,
+        message: 'Auto-reply rule created successfully'
+      });
+    } catch (error: any) {
+      logger.error('Error creating auto-reply rule:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
 
-    res.status(201).json({
-      id,
-      message: 'Rule created successfully'
-    });
-  } catch (error: any) {
-    console.error('Error creating auto-reply rule:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
+  // Auto-Reply Rules - Update
+  app.patch('/api/auto-reply/rules/:id', (req, res) => {
+    try {
+      const { id } = req.params;
+      const updateData: any = {};
 
-/**
- * PATCH /api/auto-reply/rules/:id
- * Update auto-reply rule status
- */
-router.patch('/rules/:id', (req, res) => {
-  const { id } = req.params;
-  const { isEnabled } = req.body;
+      if ('isEnabled' in req.body) {
+        updateData.isActive = req.body.isEnabled ? 1 : 0;
+      }
+      if ('silentPolicy' in req.body) {
+        updateData.silentPolicy = req.body.silentPolicy || null;
+      }
+      if ('languagePolicy' in req.body) {
+        updateData.languagePolicy = req.body.languagePolicy || null;
+      }
+      if ('escalationKeywords' in req.body) {
+        updateData.escalationKeywords = req.body.escalationKeywords || null;
+      }
+      if ('allowFollowup' in req.body) {
+        updateData.allowFollowup = req.body.allowFollowup ? 1 : 0;
+      }
+      if ('systemPrompt' in req.body) {
+        updateData.systemPrompt = req.body.systemPrompt || null;
+      }
 
-  try {
-    db.prepare(`
-      UPDATE auto_reply_rules 
-      SET is_enabled = ?
-      WHERE id = ?
-    `).run(isEnabled ? 1 : 0, id);
+      db.update(autoReplyRules)
+        .set(updateData)
+        .where(eq(autoReplyRules.id, id))
+        .run();
 
-    res.status(200).json({ message: 'Rule updated successfully' });
-  } catch (error: any) {
-    console.error('Error updating rule:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
+      res.status(200).json({ message: 'Auto-reply rule updated successfully' });
+    } catch (error: any) {
+      logger.error('Error updating auto-reply rule:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
 
-/**
- * DELETE /api/auto-reply/rules/:id
- * Delete an auto-reply rule
- */
-router.delete('/rules/:id', (req, res) => {
-  const { id } = req.params;
+  // Auto-Reply Rules - Delete
+  app.delete('/api/auto-reply/rules/:id', (req, res) => {
+    try {
+      const { id } = req.params;
+      
+      db.delete(autoReplyRules)
+        .where(eq(autoReplyRules.id, id))
+        .run();
 
-  try {
-    db.prepare('DELETE FROM auto_reply_rules WHERE id = ?').run(id);
-    res.status(200).json({ message: 'Rule deleted successfully' });
-  } catch (error: any) {
-    console.error('Error deleting rule:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
+      res.status(200).json({ message: 'Auto-reply rule deleted successfully' });
+    } catch (error: any) {
+      logger.error('Error deleting auto-reply rule:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
 
-/**
- * GET /api/auto-reply/logs
- * Get auto-reply response logs
- */
-router.get('/logs', (req, res) => {
-  try {
-    const logs = db.prepare(`
-      SELECT * FROM auto_reply_logs
-      ORDER BY created_at DESC
-      LIMIT 100
-    `).all();
+  // Auto-Reply Logs - Get all
+  app.get('/api/auto-reply/logs', (req, res) => {
+    try {
+      const logs = db.select()
+        .from(autoReplyLogs)
+        .orderBy(desc(autoReplyLogs.createdAt))
+        .all();
 
-    res.status(200).json(logs);
-  } catch (error: any) {
-    console.error('Error fetching auto-reply logs:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
+      res.status(200).json(logs);
+    } catch (error: any) {
+      logger.error('Error fetching auto-reply logs:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
 
-/**
- * POST /api/auto-reply/logs
- * Create auto-reply log entry
- */
-router.post('/logs', (req, res) => {
-  const { ruleId, fromPhone, incomingMessage, autoReply, status, ruleData } = req.body;
+  // Auto-Reply Logs - Create
+  app.post('/api/auto-reply/logs', (req, res) => {
+    try {
+      const { ruleId, fromPhone, incomingMessage, autoReply, mediaPath, mediaType, status, decisionType, detectedIntent, detectedLanguage, escalationReason, brainContext } = req.body;
+      
+      const id = 'log_' + uuidv4();
+      
+      db.insert(autoReplyLogs).values({
+        id,
+        ruleId,
+        fromPhone,
+        incomingMessage,
+        autoReply,
+        mediaPath: mediaPath || null,
+        mediaType: mediaType || null,
+        status,
+        decisionType: decisionType || null,
+        detectedIntent: detectedIntent || null,
+        detectedLanguage: detectedLanguage || null,
+        escalationReason: escalationReason || null,
+        brainContext: brainContext ? JSON.stringify(brainContext) : null,
+        createdAt: new Date().toISOString()
+      }).run();
 
-  try {
-    const id = 'log_' + Date.now();
-    
-    db.prepare(`
-      INSERT INTO auto_reply_logs (
-        id, rule_id, from_phone, incoming_message, auto_reply, status, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      id, ruleId, fromPhone, incomingMessage, autoReply, status, new Date().toISOString()
-    );
+      res.status(201).json({ id, message: 'Auto-reply log created' });
+    } catch (error: any) {
+      logger.error('Error creating auto-reply log:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
 
-    res.status(201).json({ id, message: 'Log created' });
-  } catch (error: any) {
-    console.error('Error creating auto-reply log:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
+  // Auto-Reply Brain - Evaluate
+  app.post('/api/auto-reply/brain/evaluate', async (req, res) => {
+    try {
+      const { accountId, contactId, remoteJid, message, ruleId } = req.body;
 
-export default router;
+      if (!message) {
+        return res.status(400).json({ error: 'message is required' });
+      }
+
+      const result = await buildAutoReplyBrainPreview({
+        accountId: accountId || null,
+        contactId: contactId || null,
+        remoteJid: remoteJid || null,
+        message,
+        ruleId: ruleId || null,
+      });
+
+      res.status(200).json(result);
+    } catch (error: any) {
+      logger.error('Error evaluating auto-reply brain:', error);
+      res.status(500).json({ error: error.message || 'Failed to evaluate auto-reply brain' });
+    }
+  });
+}
